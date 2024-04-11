@@ -5,6 +5,8 @@ from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import datetime
+import matplotlib.dates as mdates
 
 # Define the LSTM-based PINN architecture
 class RiverPINN(nn.Module):
@@ -132,7 +134,7 @@ def generate_graphs(model, x_locs, y_locs, bed_slope, precipitation, temperature
         y_tensor = torch.tensor([y] * len(t_range), dtype=torch.float32).view(-1, 1)
         bed_slope_tensor = torch.tensor([bed_slope] * len(t_range), dtype=torch.float32).view(-1, 1)
         precipitation_tensor = torch.tensor([precipitation] * len(t_range), dtype=torch.float32).view(-1, 1)
-        time_tensor = torch.tensor(t_range, dtype=torch.float32).view(-1, 1)
+        time_tensor = torch.tensor([t.timestamp() for t in t_range], dtype=torch.float32).view(-1, 1)
         width_tensor = torch.tensor([width] * len(t_range), dtype=torch.float32).view(-1, 1)
         temperature_tensor = torch.tensor([temperature] * len(t_range), dtype=torch.float32).view(-1, 1)
         mannings_n_tensor = torch.tensor([mannings_n] * len(t_range), dtype=torch.float32).view(-1, 1)
@@ -189,12 +191,30 @@ num_epochs = 20
 learning_rate = 0.001
 train(model, dataloader, num_epochs, learning_rate)
 
+
+#Validation Data
+input_data = pd.read_csv('ValidationData.csv')
+
+# Extract input variables from the dataframe
+x_data = torch.tensor(input_data['Lat'].values, dtype=torch.float32).view(-1, 1)
+y_data = torch.tensor(input_data['Long'].values, dtype=torch.float32).view(-1, 1)
+bed_slope_data = torch.tensor(input_data['slope'].values, dtype=torch.float32).view(-1, 1)
+precipitation_data = torch.tensor(input_data['precip'].values, dtype=torch.float32).view(-1, 1)
+time_data = torch.tensor(data['datetime'].astype(int).values, dtype=torch.float32, requires_grad=True).view(-1, 1) / 1e9
+time_data = torch.tensor(time_data, dtype=torch.float32, requires_grad=True)
+width_data = torch.tensor(input_data['width'].values, dtype=torch.float32).view(-1, 1)
+mannings_n_data = torch.tensor(input_data['n'].values, dtype=torch.float32).view(-1, 1)
+temperature_data = torch.tensor(input_data['temp'].values, dtype=torch.float32).view(-1, 1)
+
 # Generate hydrographs and stage graphs at specific locations
 x_locs = [0.1, 0.5, 0.9]
 y_locs = [0.5, 0.5, 0.5]
 bed_slope = 0.001
-precipitation = 0.01
-t_range = np.linspace(0, 1, 100)
+precipitation = 2.5
+start_time = datetime.datetime(2023, 1, 1, 0, 0)  # Start time
+end_time = datetime.datetime(2023, 1, 2, 0, 0)    # End time
+num_points = 100
+t_range = [start_time + i * (end_time - start_time) / (num_points - 1) for i in range(num_points)]
 width = 10.0
 mannings_n = 0.03
 temperature = 20.0
@@ -203,17 +223,22 @@ hydrographs, stage_graphs = generate_graphs(model, x_locs, y_locs, bed_slope, pr
 # Plot the hydrographs and stage graphs
 for i, (hydrograph, stage_graph) in enumerate(zip(hydrographs, stage_graphs)):
     plt.figure(figsize=(10, 4))
+
     plt.subplot(1, 2, 1)
-    plt.plot(t_range, hydrograph)
+    plt.plot(mdates.date2num(t_range), hydrograph)
     plt.xlabel("Time")
     plt.ylabel("Discharge")
     plt.title(f"Hydrograph at Location ({x_locs[i]}, {y_locs[i]})")
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
+    plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
 
     plt.subplot(1, 2, 2)
-    plt.plot(t_range, stage_graph)
+    plt.plot(mdates.date2num(t_range), stage_graph)
     plt.xlabel("Time")
     plt.ylabel("Gage Height")
     plt.title(f"Stage Graph at Location ({x_locs[i]}, {y_locs[i]})")
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
+    plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
 
     plt.tight_layout()
     plt.show()
