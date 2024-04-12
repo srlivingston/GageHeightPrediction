@@ -93,65 +93,75 @@ def loss_function(discharge, gage_height, discharge_obs, gage_height_obs, x, y, 
 
 # Training loop
 def train(model, dataloader, num_epochs, learning_rate):
-    # Define the optimizer (e.g., Adam)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     for epoch in range(num_epochs):
-
         for batch in dataloader:
-            # Extract input data, observed discharge, and observed gage height from the batch
             input_data, discharge_obs, gage_height_obs = batch
 
-            # Zero the gradients
             optimizer.zero_grad()
 
-            # Forward pass: Predict discharge and gage height using the model
             discharge_pred, gage_height_pred = model(input_data)
 
-            # Compute the loss using the predicted and observed values
             loss = loss_function(discharge_pred, gage_height_pred, discharge_obs, gage_height_obs,
                                  input_data[:, :, 0], input_data[:, :, 1], input_data[:, :, 2],
                                  input_data[:, :, 3], input_data[:, :, 4], input_data[:, :, 5],
                                  input_data[:, :, 6], input_data[:, :, 7])
 
-            # Backward pass: Compute the gradients
             loss.backward(retain_graph=True)
 
-            # Update the model parameters
+            # Clip gradients to mitigate "nan" loss
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
-        # Print the loss every 100 epochs
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
 
 # Generate hydrographs and stage graphs
-def generate_graphs(model, x_locs, y_locs, bed_slope, precipitation, temperature, t_range, width, mannings_n):
-    hydrographs = []
-    stage_graphs = []
+def generate_graphs(model, input_data):
+    discharge_pred_list = []
+    stage_pred_list = []
+    location_list = []
 
-    for x, y in zip(x_locs, y_locs):
-        # Create input tensors for the given location and time range
-        x_tensor = torch.tensor([x] * len(t_range), dtype=torch.float32).view(-1, 1)
-        y_tensor = torch.tensor([y] * len(t_range), dtype=torch.float32).view(-1, 1)
-        bed_slope_tensor = torch.tensor([bed_slope] * len(t_range), dtype=torch.float32).view(-1, 1)
-        precipitation_tensor = torch.tensor([precipitation] * len(t_range), dtype=torch.float32).view(-1, 1)
-        time_tensor = torch.tensor([t.timestamp() for t in t_range], dtype=torch.float32).view(-1, 1)
-        width_tensor = torch.tensor([width] * len(t_range), dtype=torch.float32).view(-1, 1)
-        temperature_tensor = torch.tensor([temperature] * len(t_range), dtype=torch.float32).view(-1, 1)
-        mannings_n_tensor = torch.tensor([mannings_n] * len(t_range), dtype=torch.float32).view(-1, 1)
+    for _, row in input_data.iterrows():
+        x = row['Lat']
+        y = row['Long']
+        bed_slope = row['slope']
+        precipitation = row['precip']
+        time = row['datetime'].timestamp()
+        width = row['width']
+        mannings_n = row['n']
+        temperature = row['temp']
+
+        # Create input tensors for the given location and time
+        x_tensor = torch.tensor([x], dtype=torch.float32).view(-1, 1)
+        y_tensor = torch.tensor([y], dtype=torch.float32).view(-1, 1)
+        bed_slope_tensor = torch.tensor([bed_slope], dtype=torch.float32).view(-1, 1)
+        precipitation_tensor = torch.tensor([precipitation], dtype=torch.float32).view(-1, 1)
+        time_tensor = torch.tensor([time], dtype=torch.float32).view(-1, 1)
+        width_tensor = torch.tensor([width], dtype=torch.float32).view(-1, 1)
+        temperature_tensor = torch.tensor([temperature], dtype=torch.float32).view(-1, 1)
+        mannings_n_tensor = torch.tensor([mannings_n], dtype=torch.float32).view(-1, 1)
 
         # Concatenate the input tensors and add an extra dimension for the LSTM input
-        input_data = torch.cat([x_tensor, y_tensor, bed_slope_tensor, precipitation_tensor, temperature_tensor,
-                                time_tensor, width_tensor, mannings_n_tensor], dim=1).unsqueeze(0)
+        input_tensor = torch.cat([x_tensor, y_tensor, bed_slope_tensor, precipitation_tensor, temperature_tensor,
+                                  time_tensor, width_tensor, mannings_n_tensor], dim=1).unsqueeze(0)
 
-        # Predict discharge and gage height using the trained model
+        # Predict discharge and stage using the trained model
         with torch.no_grad():
-            discharge_pred, gage_height_pred = model(input_data)
+            discharge_pred, stage_pred = model(input_tensor)
 
-        # Append the predicted discharge and gage height to the lists
-        hydrographs.append(discharge_pred.squeeze().detach().numpy())
-        stage_graphs.append(gage_height_pred.squeeze().detach().numpy())
+        # Append the predicted discharge, stage, and location to the lists
+        discharge_pred_list.append(discharge_pred.item())
+        stage_pred_list.append(stage_pred.item())
+        location_list.append((x, y))
 
-    return hydrographs, stage_graphs
+    # Convert the predicted discharge and stage values to NumPy arrays
+    discharge_pred_array = np.array(discharge_pred_list).reshape(-1, 1)
+    stage_pred_array = np.array(stage_pred_list).reshape(-1, 1)
+
+    return discharge_pred_array, stage_pred_array, location_list
+
 
 # Load data from CSV file
 data = pd.read_csv('FormattedData.csv')
@@ -187,13 +197,15 @@ num_layers = 2
 model = RiverPINN(input_size, hidden_size, num_layers)
 
 # Train the model
-num_epochs = 20
-learning_rate = 0.001
+num_epochs = 1000
+learning_rate = 0.0001
 train(model, dataloader, num_epochs, learning_rate)
 
 
 #Validation Data
 input_data = pd.read_csv('ValidationData.csv')
+
+input_data['datetime'] = pd.to_datetime(data['datetime'], format='mixed', dayfirst=False)
 
 # Extract input variables from the dataframe
 x_data = torch.tensor(input_data['Lat'].values, dtype=torch.float32).view(-1, 1)
@@ -201,44 +213,43 @@ y_data = torch.tensor(input_data['Long'].values, dtype=torch.float32).view(-1, 1
 bed_slope_data = torch.tensor(input_data['slope'].values, dtype=torch.float32).view(-1, 1)
 precipitation_data = torch.tensor(input_data['precip'].values, dtype=torch.float32).view(-1, 1)
 time_data = torch.tensor(data['datetime'].astype(int).values, dtype=torch.float32, requires_grad=True).view(-1, 1) / 1e9
-time_data = torch.tensor(time_data, dtype=torch.float32, requires_grad=True)
 width_data = torch.tensor(input_data['width'].values, dtype=torch.float32).view(-1, 1)
 mannings_n_data = torch.tensor(input_data['n'].values, dtype=torch.float32).view(-1, 1)
 temperature_data = torch.tensor(input_data['temp'].values, dtype=torch.float32).view(-1, 1)
 
-# Generate hydrographs and stage graphs at specific locations
-x_locs = [0.1, 0.5, 0.9]
-y_locs = [0.5, 0.5, 0.5]
-bed_slope = 0.001
-precipitation = 2.5
-start_time = datetime.datetime(2023, 1, 1, 0, 0)  # Start time
-end_time = datetime.datetime(2023, 1, 2, 0, 0)    # End time
-num_points = 100
-t_range = [start_time + i * (end_time - start_time) / (num_points - 1) for i in range(num_points)]
-width = 10.0
-mannings_n = 0.03
-temperature = 20.0
-hydrographs, stage_graphs = generate_graphs(model, x_locs, y_locs, bed_slope, precipitation, temperature, t_range, width, mannings_n)
+discharge_pred, stage_pred, locations = generate_graphs(model, input_data)
 
-# Plot the hydrographs and stage graphs
-for i, (hydrograph, stage_graph) in enumerate(zip(hydrographs, stage_graphs)):
-    plt.figure(figsize=(10, 4))
+# Create a DataFrame with the predicted discharge and stage values
+output_data = pd.DataFrame({
+    'Lat': [loc[0] for loc in locations],
+    'Long': [loc[1] for loc in locations],
+    'Discharge': discharge_pred.flatten(),
+    'Stage': stage_pred.flatten(),
+})
 
-    plt.subplot(1, 2, 1)
-    plt.plot(mdates.date2num(t_range), hydrograph)
-    plt.xlabel("Time")
-    plt.ylabel("Discharge")
-    plt.title(f"Hydrograph at Location ({x_locs[i]}, {y_locs[i]})")
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
-    plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
+# Save the output data to a CSV file
+output_data.to_csv('output_data.csv', index=False)
 
-    plt.subplot(1, 2, 2)
-    plt.plot(mdates.date2num(t_range), stage_graph)
-    plt.xlabel("Time")
-    plt.ylabel("Gage Height")
-    plt.title(f"Stage Graph at Location ({x_locs[i]}, {y_locs[i]})")
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
-    plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
+discharge_pred_all = np.concatenate(discharge_pred)
+stage_pred_all = np.concatenate(stage_pred)
 
-    plt.tight_layout()
-    plt.show()
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(mdates.date2num(input_data['datetime']), discharge_pred_all)
+plt.xlabel("Time")
+plt.ylabel("Discharge")
+plt.title("Hydrograph")
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
+plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
+
+plt.subplot(1, 2, 2)
+plt.plot(mdates.date2num(input_data['datetime']), stage_pred_all)
+plt.xlabel("Time")
+plt.ylabel("Stage")
+plt.title("Stage Graph")
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
+plt.gcf().autofmt_xdate()  # Rotate and align the x-axis labels
+
+plt.tight_layout()
+plt.show()
