@@ -15,37 +15,37 @@ data = pd.concat([data, location_dummies], axis=1)
 data.drop('location', axis=1, inplace=True)  # Drop original location column after encoding
 
 # Feature engineering for datetime
-data['hour_sin'] = np.sin(2 * np.pi * data['datetime'].dt.hour/24)
-data['hour_cos'] = np.cos(2 * np.pi * data['datetime'].dt.hour/24)
-data['minute_sin'] = np.sin(2 * np.pi * data['datetime'].dt.minute/60)
-data['minute_cos'] = np.cos(2 * np.pi * data['datetime'].dt.minute/60)
+data['hour_sin'] = np.sin(2 * np.pi * data['datetime'].dt.hour / 24)
+data['hour_cos'] = np.cos(2 * np.pi * data['datetime'].dt.hour / 24)
+data['minute_sin'] = np.sin(2 * np.pi * data['datetime'].dt.minute / 60)
+data['minute_cos'] = np.cos(2 * np.pi * data['datetime'].dt.minute / 60)
 
-# Normalize features per station using PyTorch
-numeric_columns = ['precipitation', 'temperature', 'bed_slope', 'channel_width']
+# Normalize features
+numeric_columns = ['precipitation', 'temperature', 'bed_slope', 'channel_width', 'mannings_n']
 for column in numeric_columns:
-    tensor_subset = torch.tensor(data[column].values, dtype=torch.float32)
-    mean = torch.mean(tensor_subset)
-    std = torch.std(tensor_subset)
-    normalized_tensor = (tensor_subset - mean) / std
-    data[column] = normalized_tensor.numpy()
+    data[column] = (data[column] - data[column].mean()) / data[column].std()
 
-# Converting data to PyTorch tensors
+# Prepare dataset for PyTorch
 class RiverDataset(Dataset):
     def __init__(self, dataframe, feature_columns, target_columns):
         self.features = torch.tensor(dataframe[feature_columns].astype(float).values, dtype=torch.float32)
         self.targets = torch.tensor(dataframe[target_columns].astype(float).values, dtype=torch.float32)
+        self.lat = torch.tensor(dataframe['lat'].values, dtype=torch.float32)
+        self.long = torch.tensor(dataframe['long'].values, dtype=torch.float32)
+        self.bed_slope = torch.tensor(dataframe['bed_slope'].values, dtype=torch.float32)
+        self.channel_width = torch.tensor(dataframe['channel_width'].values, dtype=torch.float32)
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.targets[idx]
+        return (self.features[idx], self.targets[idx], self.bed_slope[idx], self.channel_width[idx])
 
-feature_columns = [col for col in data.columns if col not in ['datetime', 'gage_height', 'discharge']]
+feature_columns = [col for col in data.columns if col not in ['datetime', 'gage_height', 'discharge', 'bed_slope', 'channel_width']]
 target_columns = ['gage_height', 'discharge']
 dataset = RiverDataset(data, feature_columns, target_columns)
 
-# Splitting dataset into training and testing using PyTorch
+# Splitting dataset into training and testing
 num_items = len(dataset)
 num_train = round(num_items * 0.8)
 num_test = num_items - num_train
@@ -62,10 +62,7 @@ class PINN(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
-        # Get output from LSTM
         lstm_out, _ = self.lstm(x)
-        # lstm_out shape is [batch_size, sequence_length, hidden_dim]
-        # We want the last time step output
         last_time_step = lstm_out[:, -1, :]
         output = self.fc(last_time_step)
         return output
@@ -80,18 +77,31 @@ model = PINN(input_dim, hidden_dim, output_dim, num_layers)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+# Define physics-based loss
+def physics_loss(h, Q, bed_slope, channel_width, g=9.81):
+    A = h * channel_width
+    u = Q / A
+    dh_dt = (h[1:] - h[:-1]) / (15 * 60)
+    du_dt = (u[1:] - u[:-1]) / (15 * 60)
+    continuity_loss = torch.mean(dh_dt**2)
+    momentum_loss = torch.mean(du_dt**2)
+    return continuity_loss + momentum_loss
+
 # Training the model
 num_epochs = 100
 for epoch in range(num_epochs):
-    for features, targets in train_loader:
-        # Ensure features have an extra dimension for sequence length
+    for features, targets, bed_slope, channel_width in train_loader:
         features = features.unsqueeze(1)  # Add a sequence length of 1
         optimizer.zero_grad()
-        outputs = model(features)  # Ensure features are [batch_size, sequence_length, num_features]
-        loss = criterion(outputs, targets)  # outputs and targets should now match in size
-        loss.backward()
+        outputs = model(features)
+        h = outputs[:, 0]
+        Q = outputs[:, 1]
+        mse_loss = criterion(outputs, targets)
+        phys_loss = physics_loss(h, Q, bed_slope, channel_width)
+        total_loss = mse_loss + phys_loss  # Combine losses
+        total_loss.backward()
         optimizer.step()
 
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss.item():.4f}")
 
 print("Training completed!")
