@@ -35,8 +35,6 @@ data['minute_cos'] = np.cos(2 * np.pi * data['datetime'].dt.minute / 60)
 # Conversion of gage height into channel depth
 data['channel_depth'] = data['gage_height'] + (data['gage_elevation'] - data['channel_bed_elevation'])
 
-
-
 # Normalize features
 numeric_columns = ['precipitation', 'temperature', 'bed_slope', 'channel_width', 'mannings_n']
 for column in numeric_columns:
@@ -64,45 +62,37 @@ class RiverDataset(Dataset):
         self.bed_slope = torch.tensor(dataframe['bed_slope'].values, dtype=torch.float32)
         self.channel_width = torch.tensor(dataframe['channel_width'].values, dtype=torch.float32)
         self.channel_depth = torch.tensor(dataframe['channel_depth'].values, dtype=torch.float32)
+        self.discharge = torch.tensor(dataframe['discharge'].values, dtype=torch.float32)
 
         # Compute spatial and temporal derivatives
         self.spatial_derivatives = self.compute_spatial_derivatives()
         self.temporal_derivatives = self.compute_temporal_derivatives()
 
     def compute_spatial_derivatives(self):
-        distances = [haversine(self.lat[i], self.long[i], self.lat[i+1], self.long[i+1]) for i in range(len(self.lat)-1)]
+        # Calculate spatial derivatives for channel depth and discharge
         spatial_derivatives = []
-        for i, dist in enumerate(distances):
-            # Ensure each derivative is computed as a tensor and handle division properly
-            if dist != 0:  # Prevent division by zero
-                derivative = (self.features[i+1] - self.features[i]) / dist
+        for i in range(len(self.lat) - 1):
+            dist = haversine(self.lat[i], self.long[i], self.lat[i + 1], self.long[i + 1])
+            if dist > 0:
+                depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / dist
+                discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / dist
+                spatial_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
             else:
-                derivative = torch.zeros_like(self.features[i])
-            spatial_derivatives.append(derivative)
-
-        # Convert the list of tensors to a single tensor
-        if spatial_derivatives:
-            return torch.stack(spatial_derivatives)
-        else:
-            return torch.empty(0, *self.features[0].shape)  # Return an empty tensor with the right shape if list is empty
-
+                spatial_derivatives.append(torch.zeros(2, dtype=torch.float32))
+        return torch.stack(spatial_derivatives) if spatial_derivatives else torch.empty(0, 2)
 
     def compute_temporal_derivatives(self):
-        time_deltas = [(self.datetime[i+1] - self.datetime[i]).total_seconds() for i in range(len(self.datetime)-1)]
+        # Calculate temporal derivatives for channel depth and discharge
         temporal_derivatives = []
-        for i, delta in enumerate(time_deltas):
-            # Ensure each derivative is computed as a tensor and handle division properly
-            if delta != 0:  # Prevent division by zero
-                derivative = (self.features[i+1] - self.features[i]) / delta
+        for i in range(len(self.datetime) - 1):
+            delta_t = (self.datetime[i+1] - self.datetime[i]).total_seconds()
+            if delta_t > 0:
+                depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / delta_t
+                discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / delta_t
+                temporal_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
             else:
-                derivative = torch.zeros_like(self.features[i])  # Use zeros if there is no time difference
-            temporal_derivatives.append(derivative)
-
-        # Convert the list of tensors to a single tensor
-        if temporal_derivatives:
-            return torch.stack(temporal_derivatives)
-        else:
-            return torch.empty(0, *self.features[0].shape)
+                temporal_derivatives.append(torch.zeros(2, dtype=torch.float32))
+        return torch.stack(temporal_derivatives) if temporal_derivatives else torch.empty(0, 2)
 
     def __len__(self):
         return len(self.features) - 1
@@ -126,28 +116,19 @@ train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth, g=9.81):
-    # Extract discharge (Q) from outputs
-    Q = outputs[:, 1]  # assuming the second column is discharge
+    dh_dt = temporal_derivatives[:, 0]
+    dQ_dt = temporal_derivatives[:, 1]
+    dh_dx = spatial_derivatives[:, 0]
+    dQ_dx = spatial_derivatives[:, 1]
 
-    # Calculate flow velocity u from Q and h, using channel width
-    A = channel_depth * channel_width  # Cross-sectional area assuming rectangular channel
-    u = Q / A  # Flow velocity
+    A = channel_depth * channel_width  # Cross-sectional area
+    u = outputs[:, 1] / A  # Flow velocity using discharge and area
 
-    # Derivatives needed for the Saint-Venant Equations
-    dh_dt = temporal_derivatives[:, 0]  # Temporal derivative of channel depth
-    dQ_dt = temporal_derivatives[:, 1]  # Temporal derivative of discharge
-
-    dh_dx = spatial_derivatives[:, 0]  # Spatial derivative of channel depth
-    dQ_dx = spatial_derivatives[:, 1]  # Spatial derivative of discharge
-
-    # Continuity equation (Conservation of Mass)
     continuity_loss = torch.mean((dh_dt + dQ_dx / A) ** 2)
+    momentum_loss = torch.mean((dQ_dt + u * dQ_dx + g * dh_dx * A) ** 2)
 
-    # Momentum equation (Conservation of Momentum)
-    momentum_loss = torch.mean((dQ_dt + u * dQ_dx / A + g * A * dh_dx) ** 2)
-
-    # Combine physics-based losses
     return continuity_loss + momentum_loss
+
 
 # Model definition
 class PINN(nn.Module):
@@ -167,11 +148,11 @@ input_dim_size = len(feature_columns)
 model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=2)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
-num_epochs = 100
+num_epochs = 10
 
 #weights for physics and data
-data_weight = 0.3
-physics_weight = 0.7
+data_weight = 0.4
+physics_weight = 0.6
 
 # Training loop with physics-informed loss
 for epoch in range(num_epochs):
@@ -190,13 +171,13 @@ torch.save(model.state_dict(), 'pinn_model.pth')
 
 
 # Evaluate the model
-new_data = pd.read_csv('ValidationData.csv', parse_dates=['datetime'])
+new_data = pd.read_csv('validation_data.csv', parse_dates=['datetime'])
 
 # Apply the same preprocessing steps as for the training data
-new_data['location'] = new_data['location'].astype('category')
-location_dummies = pd.get_dummies(new_data['location'], prefix='location')
+new_data['locationid'] = new_data['locationid'].astype('category')
+location_dummies = pd.get_dummies(new_data['locationid'], prefix='locationid')
 new_data = pd.concat([new_data, location_dummies], axis=1)
-new_data.drop('location', axis=1, inplace=True)
+new_data.drop('locationid', axis=1, inplace=True)
 
 #convert to metric units
 new_data['precipitation'] *= 25.4  # inches to mm
