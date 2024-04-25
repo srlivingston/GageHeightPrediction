@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from datetime import datetime
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, TensorDataset
 
 date_parser = lambda x: datetime.strptime(x, '%m/%d/%y %H:%M')
 
@@ -123,8 +123,8 @@ num_train = round(num_items * 0.8)
 num_test = num_items - num_train
 train_dataset, test_dataset = random_split(dataset, [num_train, num_test])
 
-train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=160, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=160, shuffle=False)
 
 def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth, g=9.81):
     dh_dt = temporal_derivatives[:, 0]
@@ -142,6 +142,7 @@ def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed
 
 
 # Model definition
+# Model definition
 class PINN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super(PINN, self).__init__()
@@ -158,22 +159,27 @@ class PINN(nn.Module):
         output = self.fc2(fc1_out)
         return self.output_relu(output)  # Apply ReLU at output
 
+
 # Model, loss, and optimizer
 input_dim_size = len(feature_columns)
 model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
-num_epochs = 5000
+num_epochs = 3
 
 #weights for physics and data
-data_weight = 0.7
+data_weight = 0.6
 physics_weight = 0.4
 
 train_losses = []
+data_losses = []
+physics_losses = []
 
 # Training loop with physics-informed loss
 for epoch in range(num_epochs):
     train_loss = 0.0
+    data_loss = 0.0
+    physics_loss = 0.0
     for features, targets, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth in train_loader:
         optimizer.zero_grad()
         outputs = model(features.unsqueeze(1))
@@ -184,106 +190,94 @@ for epoch in range(num_epochs):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         train_loss += total_loss.item()
+        data_loss += mse_loss.item()
+        physics_loss += physics_loss.item()
     print(f'Epoch {epoch+1} / {num_epochs}, Loss: {total_loss.item()}')
     train_losses.append(train_loss / len(train_loader))
-
+    data_losses.append(data_loss / len(train_loader))
+    physics_losses.append(physics_loss / len(train_loader))
 #save the model
 torch.save(model.state_dict(), 'pinn_model.pth')
 
 
+def evaluate_and_complete_missing(data_path, model, feature_columns, location_categories, mean_values, std_values):
+    # Load the evaluation data
+    eval_data = pd.read_csv(data_path, parse_dates=['datetime'], date_parser=date_parser)
+
+    # Convert location to categorical using previously saved categories
+    eval_data['locationid'] = pd.Categorical(eval_data['locationid'], categories=location_categories['locationid'])
+    location_dummies = pd.get_dummies(eval_data['locationid'], prefix='locationid')
+    eval_data = pd.concat([eval_data, location_dummies], axis=1)
+    eval_data.drop('locationid', axis=1, inplace=True)
+
+    eval_data['month_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.month / 12)
+    eval_data['month_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.month / 12)
+    eval_data['day_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.day / 31)
+    eval_data['day_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.day / 31)
+    eval_data['hour_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.hour / 24)
+    eval_data['hour_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.hour / 24)
+    eval_data['minute_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.minute / 60)
+    eval_data['minute_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.minute / 60)
+
+    # Apply same transformations as training
+    eval_data['discharge'] *= 0.0283168
+    eval_data['precipitation'] *= 25.4
+    eval_data['precipitation'] = np.log1p(eval_data['precipitation'])
+
+    # Normalize features using saved mean and std
+    for col in numeric_columns:
+        eval_data[col] = (eval_data[col] - mean_values[col]) / std_values[col]
+
+    # Identify rows with missing target values
+    missing_mask = eval_data[['channel_depth', 'discharge']].isna()
+    missing_indices = missing_mask.any(axis=1)
+
+    # Prepare dataset for evaluation where data is missing
+    eval_features = torch.tensor(eval_data.loc[missing_indices, feature_columns].astype(float).values, dtype=torch.float32)
+    eval_dataset = TensorDataset(eval_features)
+    eval_loader = DataLoader(eval_dataset, batch_size=160, shuffle=False)
+
+    # Predict missing values
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for batch in eval_loader:
+            features = batch[0]  # Extract features tensor from the batch
+            outputs = model(features.unsqueeze(1))  # Ensure features are correctly shaped
+            print("Features:", features)  # Debug: Inspect input features
+            print("Predictions:", outputs)  # Debug: Inspect model outputs
+            predictions.extend(outputs.detach().numpy())  # Convert tensor to numpy array
+
+    predictions = np.array(predictions)
+    predictions[:, 0] = predictions[:, 0] * std_values['channel_depth'] + mean_values['channel_depth']  # channel_depth
+    predictions[:, 1] = predictions[:, 1] * std_values['discharge'] + mean_values['discharge']  # discharge
 
 
+    # Fill missing values in original dataframe
+    eval_data.loc[missing_indices, ['channel_depth', 'discharge']] = predictions
 
-#Predict Data
-data_to_predict = pd.read_csv('validation_data.csv', parse_dates=['datetime'], date_parser=date_parser)
-
-
-
-if 'locationid' not in data_to_predict.columns:
-    raise ValueError("The 'locationid' column is missing from the prediction data.")
-
-# Load saved location categories
-location_categories = pd.read_csv('location_categories.csv')
-
-# One-hot encoding
-location_dummies = pd.get_dummies(data_to_predict['locationid'], prefix='locationid')
-
-# Add missing dummy columns if any
-for category in location_categories['locationid']:
-    if f'locationid_{category}' not in location_dummies:
-        location_dummies[f'locationid_{category}'] = 0
-
-data_to_predict = pd.concat([data_to_predict, location_dummies], axis=1)
-data_to_predict.drop('locationid', axis=1, inplace=True)
-
-# Convert precipitation and temperature
-data_to_predict['precipitation'] *= 25.4  # inches to mm
-
-# Feature engineering for datetime
-data_to_predict['month_sin'] = np.sin(2 * np.pi * data_to_predict['datetime'].dt.month / 12)
-data_to_predict['month_cos'] = np.cos(2 * np.pi * data_to_predict['datetime'].dt.month / 12)
-data_to_predict['day_sin'] = np.sin(2 * np.pi * data_to_predict['datetime'].dt.day / 31)
-data_to_predict['day_cos'] = np.cos(2 * np.pi * data_to_predict['datetime'].dt.day / 31)
-data_to_predict['hour_sin'] = np.sin(2 * np.pi * data_to_predict['datetime'].dt.hour / 24)
-data_to_predict['hour_cos'] = np.cos(2 * np.pi * data_to_predict['datetime'].dt.hour / 24)
-data_to_predict['minute_sin'] = np.sin(2 * np.pi * data_to_predict['datetime'].dt.minute / 60)
-data_to_predict['minute_cos'] = np.cos(2 * np.pi * data_to_predict['datetime'].dt.minute / 60)
-data_to_predict['precipitation'] = np.log1p(data['precipitation'])
-
-
-
-# Normalize features
-numeric_columns = ['temperature', 'bed_slope', 'channel_width', 'mannings_n', 'channel_bed_elevation', 'gage_elevation', 'precipitation']
-# Load the saved training data statistics
-train_mean = pd.read_csv('train_mean.csv', index_col=0)
-train_std = pd.read_csv('train_std.csv', index_col=0)
-
-train_mean = train_mean.squeeze()
-train_std = train_std.squeeze()
-
-# Assuming 'data_to_predict' is your prediction DataFrame
-for column in numeric_columns:
-    if column in data_to_predict.columns:
-        # Normalize using the loaded mean and std
-        data_to_predict[column] = (data_to_predict[column] - train_mean[column]) / train_std[column]
+    if len(predictions) == 0:
+        print("No predictions were made. Check input feature processing.")
     else:
-        print(f"Column {column} missing in prediction data.")
+        eval_data.loc[missing_indices, ['channel_depth', 'discharge']] = predictions
 
-# Convert DataFrame to tensor for PyTorch
-feature_columns = [col for col in data_to_predict.columns if col not in ['datetime']]
-features_to_predict = torch.tensor(data_to_predict[feature_columns].astype(float).values, dtype=torch.float32)
+    # Save the completed dataframe
+    eval_data.to_csv('Completed_Evaluation_Data.csv', index=False)
 
-print(data_to_predict.dtypes)
+    return 'Completed_Evaluation_Data.csv'
 
+print("Mean:", mean_values)
+print("Std:", std_values)
 
-if torch.isnan(features_to_predict).any():
-    print("NaN values detected in model input tensor.")
-else:
-    print("Input tensor is clean.")
-
-model = PINN(input_dim=len(feature_columns), hidden_dim=64, output_dim=2, num_layers=3)
+model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
 model.load_state_dict(torch.load('pinn_model.pth'))
-model.eval()  # Set the model to evaluation mode
+completed_csv_path = evaluate_and_complete_missing('Validation_Data.csv', model, feature_columns, location_categories, mean_values, std_values)
 
-
-# Predict gage height and discharge
-with torch.no_grad():
-    predictions = model(features_to_predict.unsqueeze(1))
-    predicted_channel_depth = predictions[:, 0].numpy()
-    predicted_discharge = predictions[:, 1].numpy()
-
-
-predictions_df = pd.DataFrame(predictions.numpy(), columns=['Predicted Channel Depth', 'Predicted Discharge'])
-predictions_df['Predicted Channel Depth'] = predictions_df['Predicted Channel Depth'] * train_std['channel_depth'] + train_mean['channel_depth']
-predictions_df['Predicted Discharge'] = predictions_df['Predicted Discharge'] * train_std['discharge'] + train_mean['discharge']
-
-result_df = pd.concat([data_to_predict.reset_index(drop=True), predictions_df.reset_index(drop=True)], axis=1)
-result_df.to_csv('Predictions_with_data.csv', index=False)
-
-print("Predictions saved to 'Predicteds.csv'.")
 
 plt.figure(figsize=(10, 5))
-plt.plot(train_losses, label='Training Loss')
+plt.plot(train_losses, label='Total Loss')
+plt.plot(data_losses, label='Data Loss')
+plt.plot(physics_losses, label='Physics Loss')
 plt.title('Training Loss Per Epoch')
 plt.xlabel('Epochs')
 plt.ylabel('Loss')
