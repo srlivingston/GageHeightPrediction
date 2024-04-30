@@ -80,29 +80,34 @@ class RiverDataset(Dataset):
         self.temporal_derivatives = self.compute_temporal_derivatives()
 
     def compute_spatial_derivatives(self):
-        # Calculate spatial derivatives for channel depth and discharge
         spatial_derivatives = []
         for i in range(len(self.lat) - 1):
-            dist = haversine(self.lat[i], self.long[i], self.lat[i + 1], self.long[i + 1])
-            if dist > 0:
-                depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / dist
-                discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / dist
-                spatial_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
+            # Check if consecutive points belong to the same location
+            if self.lat[i] == self.lat[i + 1] and self.long[i] == self.long[i + 1]:
+                dist = haversine(self.lat[i], self.long[i], self.lat[i + 1], self.long[i + 1])
+                if dist > 0:
+                    depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / dist
+                    discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / dist
+                    spatial_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
+                else:
+                    spatial_derivatives.append(torch.zeros(2, dtype=torch.float32))
             else:
-                spatial_derivatives.append(torch.zeros(2, dtype=torch.float32))
+                spatial_derivatives.append(torch.zeros(2, dtype=torch.float32))  # Reset at location change
         return torch.stack(spatial_derivatives) if spatial_derivatives else torch.empty(0, 2)
 
     def compute_temporal_derivatives(self):
-        # Calculate temporal derivatives for channel depth and discharge
         temporal_derivatives = []
         for i in range(len(self.datetime) - 1):
-            delta_t = (self.datetime[i+1] - self.datetime[i]).total_seconds()
-            if delta_t > 0:
-                depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / delta_t
-                discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / delta_t
-                temporal_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
+            if self.lat[i] == self.lat[i + 1] and self.long[i] == self.long[i + 1]:  # Check for same location
+                delta_t = (self.datetime[i+1] - self.datetime[i]).total_seconds()
+                if delta_t > 0:
+                    depth_derivative = (self.channel_depth[i+1] - self.channel_depth[i]) / delta_t
+                    discharge_derivative = (self.discharge[i+1] - self.discharge[i]) / delta_t
+                    temporal_derivatives.append(torch.tensor([depth_derivative, discharge_derivative], dtype=torch.float32))
+                else:
+                    temporal_derivatives.append(torch.zeros(2, dtype=torch.float32))
             else:
-                temporal_derivatives.append(torch.zeros(2, dtype=torch.float32))
+                temporal_derivatives.append(torch.zeros(2, dtype=torch.float32))  # Reset at location change
         return torch.stack(temporal_derivatives) if temporal_derivatives else torch.empty(0, 2)
 
     def __len__(self):
@@ -123,8 +128,8 @@ num_train = round(num_items * 0.8)
 num_test = num_items - num_train
 train_dataset, test_dataset = random_split(dataset, [num_train, num_test])
 
-train_loader = DataLoader(train_dataset, batch_size=300, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=300, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth, g=9.81):
     dh_dt = temporal_derivatives[:, 0]
@@ -145,7 +150,7 @@ def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed
 class PINN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super(PINN, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, dropout=0.5, batch_first=True)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden_dim, output_dim)
@@ -163,11 +168,10 @@ input_dim_size = len(feature_columns)
 model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
-num_epochs = 100
+num_epochs = 2000
 
 #weights for physics and data
-data_weight = 0.3
-physics_weight = 0.7
+
 
 train_losses = []
 data_losses = []
@@ -178,6 +182,10 @@ for epoch in range(num_epochs):
     train_loss = 0.0
     data_loss = 0.0
     epoch_physics_loss = 0.0
+
+    data_weight = 0.4
+    physics_weight = 0.6
+
     for features, targets, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth in train_loader:
         optimizer.zero_grad()
         outputs = model(features.unsqueeze(1))
@@ -197,74 +205,6 @@ for epoch in range(num_epochs):
 #save the model
 torch.save(model.state_dict(), 'pinn_model.pth')
 
-
-def evaluate_and_complete_missing(data_path, model, feature_columns, location_categories, mean_values, std_values):
-    # Load the evaluation data
-    eval_data = pd.read_csv(data_path, parse_dates=['datetime'], date_parser=date_parser)
-
-    # Convert location to categorical using previously saved categories
-    eval_data['locationid'] = pd.Categorical(eval_data['locationid'], categories=location_categories['locationid'])
-    location_dummies = pd.get_dummies(eval_data['locationid'], prefix='locationid')
-    eval_data = pd.concat([eval_data, location_dummies], axis=1)
-    eval_data.drop('locationid', axis=1, inplace=True)
-
-    eval_data['month_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.month / 12)
-    eval_data['month_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.month / 12)
-    eval_data['day_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.day / 31)
-    eval_data['day_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.day / 31)
-    eval_data['hour_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.hour / 24)
-    eval_data['hour_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.hour / 24)
-    eval_data['minute_sin'] = np.sin(2 * np.pi * eval_data['datetime'].dt.minute / 60)
-    eval_data['minute_cos'] = np.cos(2 * np.pi * eval_data['datetime'].dt.minute / 60)
-
-    # Apply same transformations as training
-    eval_data['discharge'] *= 0.0283168
-    eval_data['precipitation'] *= 25.4
-    eval_data['precipitation'] = np.log1p(eval_data['precipitation'])
-
-    # Normalize features using saved mean and std
-    for col in numeric_columns:
-        eval_data[col] = (eval_data[col] - mean_values[col]) / std_values[col]
-
-    # Identify rows with missing target values
-    missing_mask = eval_data[['channel_depth', 'discharge']].isna()
-    missing_indices = missing_mask.any(axis=1)
-
-    # Prepare dataset for evaluation where data is missing
-    eval_features = torch.tensor(eval_data.loc[missing_indices, feature_columns].astype(float).values, dtype=torch.float32)
-    eval_dataset = TensorDataset(eval_features)
-    eval_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
-
-    # Predict missing values
-    model.eval()
-    predictions = []
-    with torch.no_grad():
-        for batch in eval_loader:
-            features = batch[0]  # Extract features tensor from the batch
-            outputs = model(features.unsqueeze(1))  # Ensure features are correctly shaped
-            predictions.extend(outputs.detach().numpy())  # Convert tensor to numpy array
-
-    predictions = np.array(predictions)
-    predictions[:, 0] = predictions[:, 0] * std_values['channel_depth'] + mean_values['channel_depth']  # channel_depth
-    predictions[:, 1] = predictions[:, 1] * std_values['discharge'] + mean_values['discharge']  # discharge
-
-
-    # Fill missing values in original dataframe
-    eval_data.loc[missing_indices, ['channel_depth', 'discharge']] = predictions
-
-    if len(predictions) == 0:
-        print("No predictions were made. Check input feature processing.")
-    else:
-        eval_data.loc[missing_indices, ['channel_depth', 'discharge']] = predictions
-
-    # Save the completed dataframe
-    eval_data.to_csv('Completed_Evaluation_Data_1000.csv', index=False)
-
-    return 'Completed_Evaluation_Data_1000.csv'
-
-model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
-model.load_state_dict(torch.load('pinn_model.pth'))
-completed_csv_path = evaluate_and_complete_missing('Validation_Data.csv', model, feature_columns, location_categories, mean_values, std_values)
 
 
 plt.figure(figsize=(10, 5))
