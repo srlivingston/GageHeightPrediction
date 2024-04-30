@@ -123,8 +123,8 @@ num_train = round(num_items * 0.8)
 num_test = num_items - num_train
 train_dataset, test_dataset = random_split(dataset, [num_train, num_test])
 
-train_loader = DataLoader(train_dataset, batch_size=160, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=160, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=300, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=300, shuffle=False)
 
 def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth, g=9.81):
     dh_dt = temporal_derivatives[:, 0]
@@ -136,40 +136,38 @@ def compute_physics_loss(outputs, spatial_derivatives, temporal_derivatives, bed
     u = outputs[:, 1] / A  # Flow velocity using discharge and area
 
     continuity_loss = torch.mean((dh_dt + dQ_dx / A) ** 2)
-    momentum_loss = torch.mean((dQ_dt + u * dQ_dx + g * dh_dx * A) ** 2)
+    momentum_loss = torch.mean((dQ_dt + u * dQ_dx + g * A * dh_dx) ** 2)
 
     return continuity_loss + momentum_loss
 
 
 # Model definition
-# Model definition
 class PINN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super(PINN, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)  # Additional fully connected layer
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)  # Final output layer
-        self.output_relu = nn.ReLU()  # Ensure non-negative outputs
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.output_relu = nn.ReLU()
 
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         last_time_step = lstm_out[:, -1, :]
         fc1_out = self.relu(self.fc1(last_time_step))
         output = self.fc2(fc1_out)
-        return self.output_relu(output)  # Apply ReLU at output
-
+        return self.output_relu(output)
 
 # Model, loss, and optimizer
 input_dim_size = len(feature_columns)
 model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.0001)
-num_epochs = 3
+num_epochs = 100
 
 #weights for physics and data
-data_weight = 0.6
-physics_weight = 0.4
+data_weight = 0.3
+physics_weight = 0.7
 
 train_losses = []
 data_losses = []
@@ -179,7 +177,7 @@ physics_losses = []
 for epoch in range(num_epochs):
     train_loss = 0.0
     data_loss = 0.0
-    physics_loss = 0.0
+    epoch_physics_loss = 0.0
     for features, targets, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth in train_loader:
         optimizer.zero_grad()
         outputs = model(features.unsqueeze(1))
@@ -191,11 +189,11 @@ for epoch in range(num_epochs):
         optimizer.step()
         train_loss += total_loss.item()
         data_loss += mse_loss.item()
-        physics_loss += physics_loss.item()
+        epoch_physics_loss += physics_loss.item()
     print(f'Epoch {epoch+1} / {num_epochs}, Loss: {total_loss.item()}')
     train_losses.append(train_loss / len(train_loader))
     data_losses.append(data_loss / len(train_loader))
-    physics_losses.append(physics_loss / len(train_loader))
+    physics_losses.append(epoch_physics_loss / len(train_loader))
 #save the model
 torch.save(model.state_dict(), 'pinn_model.pth')
 
@@ -235,7 +233,7 @@ def evaluate_and_complete_missing(data_path, model, feature_columns, location_ca
     # Prepare dataset for evaluation where data is missing
     eval_features = torch.tensor(eval_data.loc[missing_indices, feature_columns].astype(float).values, dtype=torch.float32)
     eval_dataset = TensorDataset(eval_features)
-    eval_loader = DataLoader(eval_dataset, batch_size=160, shuffle=False)
+    eval_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
 
     # Predict missing values
     model.eval()
@@ -244,8 +242,6 @@ def evaluate_and_complete_missing(data_path, model, feature_columns, location_ca
         for batch in eval_loader:
             features = batch[0]  # Extract features tensor from the batch
             outputs = model(features.unsqueeze(1))  # Ensure features are correctly shaped
-            print("Features:", features)  # Debug: Inspect input features
-            print("Predictions:", outputs)  # Debug: Inspect model outputs
             predictions.extend(outputs.detach().numpy())  # Convert tensor to numpy array
 
     predictions = np.array(predictions)
@@ -262,12 +258,9 @@ def evaluate_and_complete_missing(data_path, model, feature_columns, location_ca
         eval_data.loc[missing_indices, ['channel_depth', 'discharge']] = predictions
 
     # Save the completed dataframe
-    eval_data.to_csv('Completed_Evaluation_Data.csv', index=False)
+    eval_data.to_csv('Completed_Evaluation_Data_1000.csv', index=False)
 
-    return 'Completed_Evaluation_Data.csv'
-
-print("Mean:", mean_values)
-print("Std:", std_values)
+    return 'Completed_Evaluation_Data_1000.csv'
 
 model = PINN(input_dim=input_dim_size, hidden_dim=64, output_dim=2, num_layers=3)
 model.load_state_dict(torch.load('pinn_model.pth'))
