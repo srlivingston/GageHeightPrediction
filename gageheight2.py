@@ -173,6 +173,10 @@ num_epochs = 2000
 #weights for physics and data
 
 
+#weights for physics and data
+data_weight_start = 0.9
+physics_weight_start = 0.1
+
 train_losses = []
 data_losses = []
 physics_losses = []
@@ -183,8 +187,8 @@ for epoch in range(num_epochs):
     data_loss = 0.0
     epoch_physics_loss = 0.0
 
-    data_weight = 0.4
-    physics_weight = 0.6
+    data_weight = data_weight_start * (1 - epoch / num_epochs)
+    physics_weight = physics_weight_start * (epoch / num_epochs)
 
     for features, targets, spatial_derivatives, temporal_derivatives, bed_slope, channel_width, channel_depth in train_loader:
         optimizer.zero_grad()
@@ -204,16 +208,3 @@ for epoch in range(num_epochs):
     physics_losses.append(epoch_physics_loss / len(train_loader))
 #save the model
 torch.save(model.state_dict(), 'pinn_model.pth')
-
-
-
-plt.figure(figsize=(10, 5))
-plt.plot(train_losses, label='Total Loss')
-plt.plot(data_losses, label='Data Loss')
-plt.plot(physics_losses, label='Physics Loss')
-plt.title('Training Loss Per Epoch')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-plt.grid(True)
-plt.show()
